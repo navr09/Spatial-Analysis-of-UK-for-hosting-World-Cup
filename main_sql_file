@@ -1,0 +1,324 @@
+------------------------------------------------------------------
+-- Author - Naveen Ramprasad | 20253139
+-- Date - 10-01-2022
+-- Title - Spatial Analysis of UK for hosting the FIFA World Cup
+------------------------------------------------------------------
+
+
+--------------------------------------------------------------
+
+-- story based code
+
+--------------------------------------------------------------
+-- 1) Create Heatmap of the stadium points all across UK
+Select "name",count(*) as "StadiumsCount" from UK_stadium_points group by "name" order by count(*) DESC
+
+
+-- 2) Create chloropleth maps on area, population and custom matrix
+
+-- Add column for area-based-density 
+alter table p220025.uk_countiesgeom add column stadium_area_density numeric default 0;
+-- Add column for population-based-density
+alter table p220025.uk_countiesgeom add column stadium_population_density numeric default 0;
+
+
+SELECT * FROM p220025.uk_countiesgeom;
+
+-------------------------------------------------------------------------------------------
+-- Update density column based on area of counties
+
+with area_polygonquery as (
+	select cg.ogc_fid,count(*)/AreaKM2 as DensityStadiumsInArea
+	from  p220025.uk_ireland_stadium_points as isp, p220025.uk_countiesgeom as cg
+	where St_Contains(cg.uk_countygeom,isp.stadiumGeomPoints)
+	group by cg.ogc_fid)
+UPDATE uk_countiesgeom
+SET stadium_area_density = ROUND(CAST(area_polygonquery.DensityStadiumsInArea as numeric),5)
+from area_polygonquery
+where area_polygonquery.ogc_fid = uk_countiesgeom.ogc_fid
+
+
+select ogc_fid,"name",stadium_area_density
+from uk_countiesgeom 
+order by ogc_fid;
+
+
+-----------------------------------------------------------------------------------------------
+-- Update density column based on population of counties
+
+-- This prevalence equation doesn't work when the number of stadiums is low and also the population is low.
+
+-- Add two columns called StadiumsCount and DensityStadiumsInPopulation
+Alter table uk_countiesgeom drop column if exists StadiumsCount;
+Alter table uk_countiesgeom drop column if exists stadium_population_density;
+
+alter table p220025.uk_countiesgeom add column StadiumsCount numeric default 0;
+alter table p220025.uk_countiesgeom add column stadium_population_density numeric default 0;
+
+-- Create column with stadiums count for each county
+with pop_polygonquery as (
+	select cg.ogc_fid,count(*) as count_stadiums
+	from  p220025.uk_ireland_stadium_points as isp, p220025.uk_countiesgeom as cg
+	where St_Contains(cg.uk_countygeom,isp.stadiumGeomPoints)
+	group by cg.ogc_fid)
+UPDATE uk_countiesgeom
+SET StadiumsCount = ROUND(CAST(pop_polygonquery.count_stadiums as numeric),5)
+from pop_polygonquery
+where pop_polygonquery.ogc_fid = uk_countiesgeom.ogc_fid;
+
+
+select ogc_fid,"name",StadiumsCount,stadium_population_density,population
+from uk_countiesgeom 
+order by ogc_fid;
+
+
+-- Use the created column above to create a population based density column.
+with PrevalenceQuery as (
+SELECT cg.ogc_fid,cg.StadiumsCount/(cg.population/1000) as PrevCalculation
+from p220025.uk_countiesgeom as cg
+where cg.population > 0)
+UPDATE uk_countiesgeom
+SET stadium_population_density = ROUND(CAST(StadiumsCount/(population/1000) as numeric),5) -- currently running logic
+from PrevalenceQuery;
+
+select ogc_fid,"name",StadiumsCount,population,stadium_population_density,stadium_area_density,areakm2
+from uk_countiesgeom 
+order by stadium_population_density desc;
+
+
+------------------------------------------------------------------------------------
+-- Custom formula for prevalence replacement
+-- The Total population of UK is 64043986
+
+-- Add column called stadium and DensityStadiumsInPopulation
+Alter table uk_countiesgeom drop column if exists stadium_prevalence_density;
+
+alter table p220025.uk_countiesgeom add column stadium_prevalence_density numeric default 0;
+
+-- Use the created column above to create a population based density column.
+with PrevalenceQuery as (
+SELECT cg.ogc_fid,cg.StadiumsCount/(64043986/cg.population) as PrevCalculation
+from p220025.uk_countiesgeom as cg
+where cg.population > 0)
+UPDATE uk_countiesgeom
+SET stadium_prevalence_density = (case when StadiumsCount >0 then ROUND(CAST((StadiumsCount)/(64043986/population) as numeric),5)
+									else 0 END)
+from PrevalenceQuery;
+
+select ogc_fid,"name",StadiumsCount,population,stadium_prevalence_density
+from uk_countiesgeom 
+order by stadium_prevalence_density Desc;
+
+-- Total population of UK
+Select sum(population) from uk_countiesgeom;
+
+----------------------------------------------------------------------------------
+
+
+-------------------------------------------
+-- Data Analysis
+-------------------------------------------
+
+---------------------------------------------------------------------------------------------------
+-- Training grounds across each stadium in the range of 3 Kms
+
+-- Training stadium data - London_training_stadium_points
+-- London professional stadiums - London_pro_soccer_stadiums
+-- London professional stadiums buffer - London_pro_soccer_stadiumsBuffer 3km radius
+
+-- Create buffer for London Pro stadiums of 3km radius
+drop table if exists London_pro_soccer_stadiumsBuffer;
+
+create table London_pro_soccer_stadiumsBuffer as (
+	select stadium_id,venuelabel,st_buffer(stadiumgeompoints,3000) as stadiumBuffer from
+	London_pro_soccer_stadiums);
+	
+alter table London_pro_soccer_stadiumsBuffer add primary key(stadium_id);
+
+create index "London_pro_soccer_stadiumsBuffer_idx" on London_pro_soccer_stadiumsBuffer using GIST(stadiumBuffer);
+
+select * from London_pro_soccer_stadiumsBuffer;
+
+-- Check distance between buffers and training points
+drop view if exists TrainingStadiumsCriteria;
+create or replace view TrainingStadiumsCriteria as (
+with distanceEqn as (
+select tr.name,Br.stadiumBuffer,
+	(Br.stadiumBuffer <->tr.train_stadium_points) as distToTrain
+	,Br.stadium_id, Br.venuelabel
+from London_training_stadium_points as tr,
+London_pro_soccer_stadiumsBuffer as Br)
+select stadium_id,venuelabel,Count(*),stadiumBuffer
+from distanceEqn
+where distToTrain = 0
+group by stadium_id,stadiumBuffer,venuelabel
+order by Count);
+
+select * from TrainingStadiumsCriteria
+order by count ASC;
+
+---------------------------------------------------------------------------------------------------
+-- Airports closest to each stadium
+
+-- Airports data - London_airport_geom
+-- London professional stadiums - London_pro_soccer_stadiums
+
+drop view if exists ClosestAirports;
+create or replace view ClosestAirports as (
+with AirportDist as (
+select st.stadium_id, st.venuelabel, ar.airport_id,ar.name,st.stadiumgeompoints
+	, st.stadiumgeompoints <-> ar.airport_geom as DistToStadium
+	,rank() over (partition by st.stadium_id order by st.stadiumgeompoints <-> ar.airport_geom asc) as ClosestAirport
+from London_airport_geom ar,
+	London_pro_soccer_stadiums st)
+	select * from AirportDist where ClosestAirport = 1 order by DistToStadium desc);
+	
+select "name",count(*) from ClosestAirports group by "name" order by count(*) Desc;
+
+---------------------------------------------------------------------------------------------------
+-- Atleast 8 distinct cuisines in the 5kms radius of each stadium (Window function featuring buffer)
+
+-- Restaurants - restaurantspoints
+-- London professional stadiums - London_pro_soccer_stadiums
+select cuisine,count(*) from restaurantspoints where cuisine is not null
+group by cuisine
+order by count(*) desc;
+
+drop table if exists ClosestRestaurants;
+create table ClosestRestaurants as (
+with a as (
+		select rp.wkb_geometry,rp.name as "RestaurantName",rp.cuisine,lp.*,ST_Distance(St_transform(rp.wkb_geometry,32654),stadiumgeompoints)/1000 as DistanceKM
+		,dense_RANK() over (partition by stadium_id,cuisine order by ST_Distance(St_transform(rp.wkb_geometry,32654),stadiumgeompoints))
+			from restaurantspoints rp,London_pro_soccer_stadiums lp
+			where ST_DWithin(St_transform(rp.wkb_geometry,32654),stadiumgeompoints,5000) and cuisine is not null
+			order by DistanceKM)
+	,b as (
+		select *
+		,Row_Number() over (partition by stadium_id order by DistanceKM)
+			from a
+			where dense_rank = 1)
+	select stadium_id,venuelabel,cuisine,distancekm,row_number,"RestaurantName",St_transform(wkb_geometry,32654) as restaurantPoints from b
+	where Row_Number <= 8--in (select min(Row_Number) from b group by stadium_id,dense_rank)
+	order by stadium_id);
+
+-- We notice that Park View Road stadium is eliminated as there are no 8 distinct cuisines across the 5km radius.
+select venuelabel,stadium_id,COUNT(*) as "NumberOfDistinctCuisines" from ClosestRestaurants group by venuelabel,stadium_id order by count(*) ASC 
+
+create table ClosestRestaurants_stadiums as (
+select lp.stadiumgeompoints,venuelabel,count(*) as "TotalRestaurants"
+			from restaurantspoints rp,London_pro_soccer_stadiums lp
+			where ST_DWithin(St_transform(rp.wkb_geometry,32654),stadiumgeompoints,5000) and rp.cuisine is not null
+			group by lp.stadiumgeompoints,venuelabel
+			order by count(*))
+
+-- Bonus Top 5 cuisines which are usually closest to stadiums.
+with a as (
+		select rp.wkb_geometry,rp.name as "RestaurantName",rp.cuisine,lp.*,ST_Distance(St_transform(rp.wkb_geometry,32654),stadiumgeompoints)/1000 as DistanceKM
+		,dense_RANK() over (partition by stadium_id,cuisine order by ST_Distance(St_transform(rp.wkb_geometry,32654),stadiumgeompoints))
+			from restaurantspoints rp,London_pro_soccer_stadiums lp
+			where ST_DWithin(St_transform(rp.wkb_geometry,32654),stadiumgeompoints,5000) and cuisine is not null
+			order by DistanceKM)
+ 	,b as (
+		select *
+		,Row_Number() over (partition by stadium_id order by DistanceKM)
+			from a
+			where dense_rank = 1)
+ 	,c as (
+		select stadium_id,"RestaurantName",cuisine,distancekm,row_number,St_transform(wkb_geometry,32654) as restaurantPoints 
+		from b
+		where Row_Number <= 8--in (select min(Row_Number) from b group by stadium_id,dense_rank)
+		order by stadium_id)
+	Select distinct cuisine,count(*) from c group by cuisine order by count(*) DESC;
+	
+---------------------------------------------------------------------------------------------------
+-- Find if there are minimum number of hotels(8) in the buffer of 3kms radius
+
+-- Hotels - London_hotelPoints_cons;
+-- Stadium Buffer - London_pro_soccer_stadiumsBuffer_hotels;
+
+-- Create buffer for London Pro stadiums 3 kms
+drop table if exists London_pro_soccer_stadiumsBuffer_hotels cascade;
+
+create table London_pro_soccer_stadiumsBuffer_hotels as (
+	select stadium_id,venuelabel,st_buffer(stadiumgeompoints,3000) as stadiumBuffer from
+	London_pro_soccer_stadiums);
+	
+alter table London_pro_soccer_stadiumsBuffer_hotels add primary key(stadium_id);
+
+create index "London_pro_soccer_stadiumsBufferhotels_idx" on London_pro_soccer_stadiumsBuffer using GIST(stadiumBuffer);
+
+-- Check distanct between Hotels and Pro-Soccer Stadiums
+drop view if exists HotelsCriteria;
+create or replace view HotelsCriteria as (
+with distanceEqn as (
+select Cr."name",Br.stadiumBuffer,
+	(Br.stadiumBuffer <->Cr.hotelspoints) as distToTrain
+	,Br.stadium_id, Br.venuelabel
+from London_hotelPoints_cons as Cr,
+London_pro_soccer_stadiumsBuffer_hotels as Br)
+select stadium_id,venuelabel,Count(*),stadiumBuffer
+from distanceEqn
+where distToTrain = 0
+group by stadium_id,stadiumBuffer,venuelabel
+order by Count);
+
+---------------------------------------------------------------------------------------------------
+-- Find the nearest hospital to each stadium and the distance should not be more than 3kms
+
+-- Hospital data - london_hospital_points
+-- London Professional Soccer stadiums - London_pro_soccer_stadiums
+
+create table London_pro_soccer_stadiumsBuffer_hospital as (
+	select stadium_id,venuelabel,st_buffer(stadiumgeompoints,5000) as stadiumBuffer from
+	London_pro_soccer_stadiums);
+
+-- View to make line to nearest hospital
+drop view if exists HospitalsCriteria;
+create or replace view HospitalsCriteria as (
+with distanceEqn as (
+select Hr."name",Pr.stadiumgeompoints,
+	(Pr.stadiumgeompoints <->Hr.hospitalpoints)/1000 as distToHosp
+	,dense_RANK() over (partition by stadium_id order by (Pr.stadiumgeompoints <->Hr.hospitalpoints) ASC)
+	,Pr.stadium_id, Hr.hospitalpoints
+from london_hospital_points as Hr,
+London_pro_soccer_stadiums as Pr
+where Hr."name" is not null)
+select stadium_id,"name",distToHosp,st_makeline(hospitalpoints,stadiumgeompoints) as lineToHosp
+from distanceEqn where dense_rank=1);
+
+-- View to select geom points of only the nearest hospitals
+drop view if exists HospitalsPointsCriteria;
+create or replace view HospitalsPointsCriteria as (
+with distanceEqn as (
+select Hr."name",Pr.stadiumgeompoints,
+	(Pr.stadiumgeompoints <->Hr.hospitalpoints)/1000 as distToHosp
+	,dense_RANK() over (partition by stadium_id order by (Pr.stadiumgeompoints <->Hr.hospitalpoints) ASC)
+	,Pr.stadium_id, Hr.hospitalpoints
+from london_hospital_points as Hr,
+London_pro_soccer_stadiums as Pr
+where Hr."name" is not null)
+select stadium_id,"name",hospitalpoints
+from distanceEqn where dense_rank=1);
+
+
+with distanceEqn as (
+select Hr."name",Pr.stadiumgeompoints,
+	(Pr.stadiumgeompoints <->Hr.hospitalpoints)/1000 as "distToHosp"
+	,dense_RANK() over (partition by stadium_id order by (Pr.stadiumgeompoints <->Hr.hospitalpoints) ASC)
+	,Pr.stadium_id,Pr.venuelabel, Hr.hospitalpoints
+from london_hospital_points as Hr,
+London_pro_soccer_stadiums as Pr
+where Hr."name" is not null)
+select stadium_id,venuelabel,"name" as "HospitalName","distToHosp"
+from distanceEqn where dense_rank=1 order by "distToHosp" DESC;
+-----------------------------------------------------------------------------
+
+-------------------------------------------
+-- Takeaway
+-------------------------------------------
+
+drop table if exists FinalListStadiums;
+create table FinalListStadiums as (
+select stadium_id,venuelabel,stadiumgeompoints from London_pro_soccer_stadiums
+where stadium_id not in (1,2,4,5,7,29,13,14,17,19,33,38));
+
